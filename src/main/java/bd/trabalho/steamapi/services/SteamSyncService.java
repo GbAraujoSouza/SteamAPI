@@ -15,8 +15,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.util.Date;
-import java.util.Optional;
+import java.util.*;
 
 @Service
 public class SteamSyncService {
@@ -53,27 +52,54 @@ public class SteamSyncService {
     }
 
     private void syncPlayerSummary() {
-        String url = String.format("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=%s&steamids=%s", apiKey, steamIdToSync);
-        String jsonData = fetchData(url);
+        String url = String.format("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=%s&steamids=", apiKey);
+        String friendsUrl = String.format("https://api.steampowered.com/ISteamUser/GetFriendList/v0001/?key=%s&steamid=%s&relationship=all", apiKey, steamIdToSync);
 
-        if (jsonData == null) return;
+        String jsonFriendsData = fetchData(friendsUrl);
 
-        JSONObject root = new JSONObject(jsonData);
-        JSONArray players = root.getJSONObject("response").getJSONArray("players");
-        if (players.isEmpty()) return;
+        JSONObject friendsPayload = new JSONObject(jsonFriendsData);
+        JSONArray friends = friendsPayload.getJSONObject("friendslist").getJSONArray("friends");
 
-        JSONObject playerJson = players.getJSONObject(0);
-        String steamId = playerJson.getString("steamid");
+        // 1. Create a list to hold all the friend steam IDs
+        List<String> friendIds = new ArrayList<>();
 
-        // Use Optional to handle both new and existing players gracefully
-        Player player = playerRepository.findById(steamId).orElse(new Player());
-        player.setSteamId(steamId);
-        player.setNickname(playerJson.getString("personaname"));
-        player.setProfileImageUrl(playerJson.getString("avatar"));
-        player.setSignDate(new Date(playerJson.getString("timecreated")));
+        // 2. Loop through the JSON array and add each friend's steamid to the list
+        for (int i = 0; i < friends.length(); i++) {
+            JSONObject friend = friends.getJSONObject(i);
+            friendIds.add(friend.getString("steamid"));
+        }
+        // Add my own id to list
+        friendIds.add(steamIdToSync);
 
-        playerRepository.save(player);
-        System.out.println("Saved/Updated player: " + player.getNickname());
+        String friendsIdsStringQuery = String.join(",", friendIds);
+
+        String payload = fetchData(url+friendsIdsStringQuery);
+        JSONObject meAndFriends = new JSONObject(payload);
+
+        JSONArray playersArray = meAndFriends.getJSONObject("response").getJSONArray("players");
+
+        List<Player> playersToSave = new ArrayList<>();
+        for (int i = 0; i < playersArray.length(); i++) {
+            JSONObject playerJson = playersArray.getJSONObject(i);
+            Player player = playerRepository.findById(playerJson.getString("steamid")).orElse(new Player());
+
+            // Set all the properties
+            player.setSteamId(playerJson.getString("steamid"));
+            player.setNickname(playerJson.getString("personaname"));
+            player.setRealName(playerJson.optString("realname", null));
+            player.setProfileImageUrl(playerJson.getString("avatar"));
+            player.setSignDate(new Date(playerJson.getInt("timecreated")));
+            player.setCountry(playerJson.optString("loccountrycode"));
+
+
+            playersToSave.add(player);
+        }
+
+        playerRepository.saveAll(playersToSave);
+        System.out.printf("Successfully saved or updated %d players.%n", playersToSave.size());
+
+
+
     }
 
 //    private void syncOwnedGames() {
