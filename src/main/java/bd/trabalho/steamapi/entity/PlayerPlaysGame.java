@@ -10,24 +10,26 @@ import lombok.Setter;
 @Setter
 @NoArgsConstructor
 public class PlayerPlaysGame {
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
+
+    @EmbeddedId
+    private PlayerPlaysGameId playerPlaysGameId;
 
     @ManyToOne
-    @JoinColumn(name = "player_id")
+    @MapsId("steamId")
+    @JoinColumn(name = "steam_id")
     private Player player;
 
     @ManyToOne
+    @MapsId("gameId")
     @JoinColumn(name = "game_id")
     private Game game;
 
     private Integer playtimeForever;
 
-    public PlayerPlaysGame(Long id, Player player, Game game, Integer playtimeForever) {
-        this.id = id;
+    public PlayerPlaysGame(Player player, Game game, Integer playtimeForever) {
         this.player = player;
         this.game = game;
         this.playtimeForever = playtimeForever;
+        this.playerPlaysGameId = new PlayerPlaysGameId(player.getSteamId(), game.getAppId());
     }
 }
