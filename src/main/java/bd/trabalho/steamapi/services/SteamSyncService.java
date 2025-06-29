@@ -1,9 +1,13 @@
 package bd.trabalho.steamapi.services;
 
+import bd.trabalho.steamapi.entity.Game;
 import bd.trabalho.steamapi.entity.Player;
+import bd.trabalho.steamapi.entity.PlayerPlaysGame;
+import bd.trabalho.steamapi.entity.Tag;
 import bd.trabalho.steamapi.repositories.GameRepository;
 import bd.trabalho.steamapi.repositories.PlayerPlaysGameRepository;
 import bd.trabalho.steamapi.repositories.PlayerRepository;
+import bd.trabalho.steamapi.repositories.TagRepository;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.springframework.beans.factory.annotation.Value;
@@ -15,8 +19,9 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.util.Date;
-import java.util.Optional;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 
 @Service
 public class SteamSyncService {
@@ -24,6 +29,7 @@ public class SteamSyncService {
     private final PlayerRepository playerRepository;
     private final GameRepository gameRepository;
     private final PlayerPlaysGameRepository playerPlaysGameRepository;
+    private final TagRepository tagRepository;
     private final HttpClient httpClient;
 
     // These values are injected from application.properties
@@ -33,61 +39,144 @@ public class SteamSyncService {
     @Value("${steam.api.steamid}")
     private String steamIdToSync;
 
-    public SteamSyncService(PlayerRepository playerRepository, GameRepository gameRepository, PlayerPlaysGameRepository playerPlaysGameRepository) {
+    private final DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMM d, yyyy", Locale.ENGLISH);
+
+    public SteamSyncService(PlayerRepository playerRepository, GameRepository gameRepository, PlayerPlaysGameRepository playerPlaysGameRepository, TagRepository tagRepository) {
         this.playerRepository = playerRepository;
         this.gameRepository = gameRepository;
         this.playerPlaysGameRepository = playerPlaysGameRepository;
+        this.tagRepository = tagRepository;
         this.httpClient = HttpClient.newHttpClient();
     }
 
     @Transactional // Ensures all database operations in this method are part of a single transaction.
-    public void syncAllDataForUser() {
+    public void syncAllDataForUser() throws InterruptedException {
         if (apiKey.equals("YOUR_API_KEY_HERE")) {
             System.err.println("FATAL ERROR: Please set your 'steam.api.key' in application.properties");
             return;
         }
         System.out.println("Starting sync for SteamID: " + steamIdToSync);
         syncPlayerSummary();
-//        syncOwnedGames();
+        syncOwnedGames();
         System.out.println("Finished sync for SteamID: " + steamIdToSync);
     }
 
-    private void syncPlayerSummary() {
-        String url = String.format("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=%s&steamids=%s", apiKey, steamIdToSync);
-        String jsonData = fetchData(url);
+    private void syncPlayerSummary() throws InterruptedException {
+        String url = String.format("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=%s&steamids=", apiKey);
+        String friendsUrl = String.format("https://api.steampowered.com/ISteamUser/GetFriendList/v0001/?key=%s&steamid=%s&relationship=all", apiKey, steamIdToSync);
 
-        if (jsonData == null) return;
+        String jsonFriendsData = fetchData(friendsUrl);
 
-        JSONObject root = new JSONObject(jsonData);
-        JSONArray players = root.getJSONObject("response").getJSONArray("players");
-        if (players.isEmpty()) return;
+        JSONObject friendsPayload = new JSONObject(jsonFriendsData);
+        JSONArray friends = friendsPayload.getJSONObject("friendslist").getJSONArray("friends");
 
-        JSONObject playerJson = players.getJSONObject(0);
-        String steamId = playerJson.getString("steamid");
+        // 1. Create a list to hold all the friend steam IDs
+        List<String> friendIds = new ArrayList<>();
 
-        // Use Optional to handle both new and existing players gracefully
-        Player player = playerRepository.findById(steamId).orElse(new Player());
-        player.setSteamId(steamId);
-        player.setNickname(playerJson.getString("personaname"));
-        player.setProfileImageUrl(playerJson.getString("avatar"));
-        player.setSignDate(new Date(playerJson.getString("timecreated")));
+        // 2. Loop through the JSON array and add each friend's steamid to the list
+        for (int i = 0; i < friends.length(); i++) {
+            JSONObject friend = friends.getJSONObject(i);
+            friendIds.add(friend.getString("steamid"));
+        }
+        // Add my own id to list
+        friendIds.add(steamIdToSync);
 
-        playerRepository.save(player);
-        System.out.println("Saved/Updated player: " + player.getNickname());
+        String friendsIdsStringQuery = String.join(",", friendIds);
+        Thread.sleep(5000);
+        String payload = fetchData(url+friendsIdsStringQuery);
+        JSONObject meAndFriends = new JSONObject(payload);
+
+        JSONArray playersArray = meAndFriends.getJSONObject("response").getJSONArray("players");
+
+        List<Player> playersToSave = new ArrayList<>();
+        for (int i = 0; i < playersArray.length(); i++) {
+            JSONObject playerJson = playersArray.getJSONObject(i);
+            Player player = playerRepository.findById(playerJson.getString("steamid")).orElse(new Player());
+
+            // Set all the properties
+            player.setSteamId(playerJson.getString("steamid"));
+            player.setNickname(playerJson.getString("personaname"));
+            player.setRealName(playerJson.optString("realname", null));
+            player.setProfileImageUrl(playerJson.getString("avatar"));
+            player.setSignDate(new Date(playerJson.optInt("timecreated", 0)));
+            player.setCountry(playerJson.optString("loccountrycode"));
+
+
+            playersToSave.add(player);
+        }
+
+        playerRepository.saveAll(playersToSave);
+        System.out.printf("Successfully saved or updated %d players.%n", playersToSave.size());
+
+
+
     }
 
-//    private void syncOwnedGames() {
-//        // First, ensure the player exists in our DB.
-//        Optional<Player> playerOpt = playerRepository.findById(steamIdToSync);
-//        if (playerOpt.isEmpty()) {
-//            System.err.println("Cannot sync games. Player with ID " + steamIdToSync + " not found. Run player sync first.");
-//            return;
-//        }
-//        Player player = playerOpt.get();
-//
-//        String url = String.format("https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key=%s&steamid=%s&format=json&include_appinfo=true", apiKey, steamIdToSync);
-//        String jsonData = fetchData(url);
-//
+    private void syncOwnedGames() throws InterruptedException {
+        // First, ensure the player exists in our DB.
+        List<Player> players = (List<Player>) playerRepository.findAll();
+
+
+        for  (Player player : players) {
+            Thread.sleep(5000);
+            String url = String.format("https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key=%s&format=json&include_appinfo=&steamid=", apiKey);
+            String jsonData = fetchData(url+player.getSteamId());
+
+            JSONObject root = new JSONObject(jsonData).getJSONObject("response");
+            JSONArray games = root.getJSONArray("games");
+
+            List<Game> gamesToSave = new ArrayList<>();
+            for(int i = 0; i < games.length(); i++) {
+                JSONObject game = games.getJSONObject(i);
+                String app_id = game.optString("appid");
+                String app_name = game.optString("name");
+                Thread.sleep(5000);
+                String gameUrl = String.format("https://store.steampowered.com/api/appdetails?appids=%s", app_id);
+                String data = fetchData(gameUrl);
+
+                JSONObject gamePayload = new JSONObject(data).getJSONObject(app_id).getJSONObject("data");
+                Game g = gameRepository.findById(gamePayload.optString(app_id)).orElse(new Game());
+
+                g.setAppId(app_id);
+                g.setName(app_name);
+                g.setDescription(gamePayload.optString("short_description"));
+
+                double price = 0.0;
+                JSONObject priceObject = gamePayload.optJSONObject("price_overview", null);
+                if (priceObject != null) {
+                    price = priceObject.optDouble("initial") / 100.0;
+                }
+                g.setPrice(price);
+//                String release = gamePayload.getJSONObject("release_date").getString("date");
+                g.setReleaseDate(gamePayload.getJSONObject("release_date").getString("date"));
+
+                gamesToSave.add(g);
+
+                JSONArray tags = gamePayload.optJSONArray("categories");
+
+                for (int j = 0; j < tags.length(); j++) {
+                    JSONObject tagObject = tags.getJSONObject(j);
+                    int tagId = tagObject.getInt("id");
+                    String tagName = tagObject.getString("description");
+
+                    Tag t = tagRepository.findById(tagId).orElse(new Tag());
+                    t.setName(tagName);
+                    t.setMarkerId(tagId);
+                    tagRepository.save(t);
+
+                    g.addTag(t);
+                }
+
+                // Save relation 'plays'
+                playerPlaysGameRepository.save(new PlayerPlaysGame(player, g, gamePayload.getInt("playtime_forever")));
+
+                // Save relation 'owns'
+                player.getGames().add(g);
+
+            }
+            gameRepository.saveAll(gamesToSave);
+        }
+
 //        if (jsonData == null) return;
 //
 //        JSONObject root = new JSONObject(jsonData).getJSONObject("response");
@@ -117,7 +206,7 @@ public class SteamSyncService {
 //
 //            playerGameRepository.save(playerGame);
 //        }
-//    }
+    }
 
     private String fetchData(String url) {
         try {
